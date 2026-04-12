@@ -1,8 +1,13 @@
 """
 Tool definitions and executor for the Canva Fitness Design Agent.
 
-TOOLS: list of tool schemas passed to the Anthropic API.
-ToolExecutor: dispatches tool calls to their Python implementations.
+TOOLS: our custom tool schemas passed to the Anthropic API alongside the
+       Canva MCP server tools (which the API discovers automatically).
+ToolExecutor: dispatches our custom tool calls only.
+
+Canva design creation is handled by the Canva AI Connector MCP server
+(https://mcp.canva.com/mcp), which creates actual designed content from
+natural language prompts and returns shareable Canva template links.
 """
 
 from __future__ import annotations
@@ -10,20 +15,40 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import requests
 from rich.console import Console
 
 import config
 import research
-from canva_client import CanvaClient, CanvaAPIError, CanvaConnectionError, CanvaExportTimeoutError
-
-if TYPE_CHECKING:
-    pass
 
 
-# ── Tool schemas (Claude sees these) ──────────────────────────────────────────
+# ── Data models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class EtsyListing:
+    title: str                      # ≤140 chars, SEO-optimized
+    description: str                # bullet-pointed, keyword-rich
+    tags: list[str]                 # exactly 13
+    suggested_price_usd: float
+    category: str
+    canva_template_url: str         # the shareable Canva link sold to customers
+
+
+@dataclass
+class DesignResult:
+    title: str
+    format: str                     # "instagram_story" | "instagram_post" | etc.
+    canva_design_url: str           # Canva view/edit URL from MCP
+    canva_template_url: str         # shareable "copy this template" link for Etsy
+    design_brief_summary: str
+    etsy_listing: EtsyListing | None = None
+
+
+# ── Custom tool schemas (Claude sees these alongside Canva MCP tools) ─────────
+#
+# We define ONLY our research and Etsy tools here.
+# Canva design creation tools come automatically from the Canva MCP server.
 
 TOOLS: list[dict] = [
     {
@@ -32,7 +57,7 @@ TOOLS: list[dict] = [
             "Search the web for current fitness influencer design trends, popular color "
             "palettes, typography, and what makes fitness designs sell on Etsy. "
             "Call this tool at least TWICE with different queries and focus areas "
-            "before calling synthesize_design_brief or any canva_ tools."
+            "before creating any designs. Returns raw search result text."
         ),
         "input_schema": {
             "type": "object",
@@ -41,7 +66,7 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": (
                         "A precise search query. Include the year (2026), niche "
-                        "(fitness influencer), and the specific aspect you are researching."
+                        "(fitness influencer), and the specific aspect being researched."
                     ),
                 },
                 "focus": {
@@ -63,9 +88,10 @@ TOOLS: list[dict] = [
         "name": "synthesize_design_brief",
         "description": (
             "After collecting web search results, call this tool ONCE to synthesize "
-            "all research into a structured DesignBrief (color palette, fonts, layout, "
-            "Etsy tags). Must be called after at least 2 web_search_fitness_trends calls "
-            "and before any canva_ tools."
+            "all research into a structured DesignBrief: color palette, fonts, layout "
+            "ideas, motivational copy suggestions, and 13 Etsy tags. "
+            "Must be called after at least 2 web_search_fitness_trends calls "
+            "and before creating any designs."
         ),
         "input_schema": {
             "type": "object",
@@ -77,7 +103,7 @@ TOOLS: list[dict] = [
                 "search_summaries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "All raw text results from previous web_search_fitness_trends calls.",
+                    "description": "All raw result text from previous web_search_fitness_trends calls.",
                 },
                 "design_count": {
                     "type": "integer",
@@ -93,95 +119,28 @@ TOOLS: list[dict] = [
                         "instagram_landscape",
                         "mixed",
                     ],
-                    "description": "Target Instagram format for the designs.",
+                    "description": "Target Instagram format.",
                 },
             },
             "required": ["user_prompt", "search_summaries", "design_count", "design_format"],
         },
     },
     {
-        "name": "canva_create_design",
-        "description": (
-            "Creates a new blank design in Canva with specified pixel dimensions. "
-            "Returns a design_id and an edit_url the user can open in Canva to customize. "
-            "Instagram Story: width=1080 height=1920. "
-            "Instagram Post (square): width=1080 height=1080. "
-            "Instagram Landscape: width=1080 height=608. "
-            "Space calls at least 3 seconds apart to respect rate limits."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": (
-                        "Descriptive human-readable design title. Make it unique and "
-                        "evocative of the design intent, e.g. 'BEAST MODE — Neon Story'."
-                    ),
-                },
-                "width": {
-                    "type": "integer",
-                    "description": "Width in pixels (40–8000).",
-                    "minimum": 40,
-                    "maximum": 8000,
-                },
-                "height": {
-                    "type": "integer",
-                    "description": "Height in pixels (40–8000).",
-                    "minimum": 40,
-                    "maximum": 8000,
-                },
-                "design_brief_summary": {
-                    "type": "string",
-                    "description": (
-                        "2-3 sentence summary of the design intent for this specific canvas "
-                        "(color mood, layout idea, motivational copy to use). "
-                        "This is logged for the user's reference."
-                    ),
-                },
-            },
-            "required": ["title", "width", "height"],
-        },
-    },
-    {
-        "name": "canva_export_design",
-        "description": (
-            "Exports a Canva design to PNG and returns download URLs. "
-            "The export is asynchronous; this tool polls until complete (up to 120 seconds). "
-            "Use format='png' for Etsy-ready high-resolution files. "
-            "Only call after canva_create_design has returned a design_id."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "design_id": {
-                    "type": "string",
-                    "description": "The design_id returned by canva_create_design.",
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["png", "pdf", "jpg"],
-                    "description": "Export format. Use 'png' for Etsy digital downloads.",
-                    "default": "png",
-                },
-            },
-            "required": ["design_id"],
-        },
-    },
-    {
         "name": "generate_etsy_listing",
         "description": (
-            "Generates a complete Etsy listing for a fitness design: "
-            "SEO title (≤140 chars), keyword-rich description with bullet points, "
-            "all 13 tags, suggested USD price, and Etsy category path. "
-            "Call once per design after it has been exported."
+            "Generates a complete Etsy listing for a finished Canva design: "
+            "SEO title (≤140 chars), keyword-rich bullet-point description, "
+            "all 13 Etsy tags, suggested USD price, and Etsy category. "
+            "The listing explains that customers receive a shareable Canva template link "
+            "they can copy to their own Canva account and customize. "
+            "Call once per design after Canva has created it and returned a design URL."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "design_title": {
                     "type": "string",
-                    "description": "The design title (same as used in canva_create_design).",
+                    "description": "The design title (as given to the Canva tool).",
                 },
                 "design_format": {
                     "type": "string",
@@ -194,75 +153,54 @@ TOOLS: list[dict] = [
                 "color_palette": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Hex codes of the design's primary colors.",
+                    "description": "Hex codes or color names used in the design.",
                 },
                 "mood_keywords": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Mood/feeling words that describe this design.",
                 },
-                "copy_suggestion": {
+                "copy_used": {
                     "type": "string",
-                    "description": "The motivational text/headline intended for this design.",
+                    "description": "The motivational text/headline used in this design.",
                 },
-                "download_url": {
+                "canva_design_url": {
                     "type": "string",
-                    "description": "The Canva export download URL for this design (if available).",
+                    "description": (
+                        "The Canva URL returned by the Canva tool for this design. "
+                        "This becomes the template link shared with Etsy customers."
+                    ),
                 },
             },
-            "required": ["design_title", "design_format", "design_style"],
+            "required": ["design_title", "design_format", "design_style", "canva_design_url"],
         },
     },
 ]
 
 
-# ── Etsy listing data model ────────────────────────────────────────────────────
-
-@dataclass
-class EtsyListing:
-    title: str
-    description: str
-    tags: list[str]
-    suggested_price_usd: float
-    category: str
-
-
-# ── Design result data model ───────────────────────────────────────────────────
-
-@dataclass
-class DesignResult:
-    design_id: str
-    title: str
-    format: str
-    width: int
-    height: int
-    edit_url: str
-    design_brief_summary: str
-    download_urls: list[str] = field(default_factory=list)
-    etsy_listing: EtsyListing | None = None
-
-
 # ── Tool executor ─────────────────────────────────────────────────────────────
 
 class ToolExecutor:
-    def __init__(self, canva: CanvaClient, console: Console):
-        self._canva = canva
+    """
+    Executes our custom tool calls (research + Etsy listing generation).
+    Canva design tool calls are handled transparently by the Anthropic API
+    via the Canva MCP server — we never see those in the dispatch loop.
+    """
+
+    def __init__(self, console: Console):
         self._console = console
-        # State accumulated across calls within a single agent run
         self._search_results: list[str] = []
         self._brief: research.DesignBrief | None = None
         self.design_results: list[DesignResult] = []
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
         """
-        Route a tool call by name, execute it, and return the result as a JSON string.
-        On error, returns {"error": "..."} so Claude can reason about the failure.
+        Route a custom tool call by name and return the result as a JSON string.
+        Returns {"error": "..."} on failure so Claude can reason about it.
         """
         dispatch = {
             "web_search_fitness_trends": self._web_search,
             "synthesize_design_brief":   self._synthesize_brief,
-            "canva_create_design":       self._create_design,
-            "canva_export_design":       self._export_design,
             "generate_etsy_listing":     self._generate_etsy_listing,
         }
         handler = dispatch.get(tool_name)
@@ -270,18 +208,9 @@ class ToolExecutor:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
         try:
             return handler(tool_input)
-        except CanvaAPIError as exc:
-            self._console.print(f"[red]Canva API error:[/red] {exc}")
-            return json.dumps({"error": str(exc)})
-        except CanvaConnectionError as exc:
-            self._console.print(f"[red]Network error:[/red] {exc}")
-            return json.dumps({"error": str(exc)})
-        except CanvaExportTimeoutError as exc:
-            self._console.print(f"[yellow]Export timeout:[/yellow] {exc}")
-            return json.dumps({"error": str(exc)})
         except Exception as exc:
-            self._console.print(f"[red]Unexpected error in {tool_name}:[/red] {exc}")
-            return json.dumps({"error": f"Unexpected error: {exc}"})
+            self._console.print(f"[red]Tool error in {tool_name}:[/red] {exc}")
+            return json.dumps({"error": f"Tool error: {exc}"})
 
     # ── Tool implementations ───────────────────────────────────────────────────
 
@@ -310,70 +239,14 @@ class ToolExecutor:
         )
         return json.dumps(brief.to_dict())
 
-    def _create_design(self, inp: dict) -> str:
-        title  = inp["title"]
-        width  = inp["width"]
-        height = inp["height"]
-        brief_summary = inp.get("design_brief_summary", "")
-        format_name = _dimensions_to_format(width, height)
-
-        self._console.print(f"[cyan]Creating design:[/cyan] '{title}' ({width}×{height})")
-
-        data = self._canva.create_design(width=width, height=height, title=title)
-        design = data.get("design", {})
-        design_id = design.get("id", "")
-        urls = design.get("urls", {})
-        edit_url = urls.get("edit_url", "")
-
-        result = DesignResult(
-            design_id=design_id,
-            title=title,
-            format=format_name,
-            width=width,
-            height=height,
-            edit_url=edit_url,
-            design_brief_summary=brief_summary,
-        )
-        self.design_results.append(result)
-
-        self._console.print(f"[green]Created:[/green] {design_id} → {edit_url}")
-        return json.dumps({
-            "design_id": design_id,
-            "edit_url": edit_url,
-            "title": title,
-            "width": width,
-            "height": height,
-        })
-
-    def _export_design(self, inp: dict) -> str:
-        design_id    = inp["design_id"]
-        format_      = inp.get("format", "png")
-        self._console.print(f"[cyan]Exporting:[/cyan] {design_id} as {format_}")
-
-        job_data  = self._canva.create_export_job(design_id, format=format_)
-        job_id    = job_data.get("job", {}).get("id", "")
-        if not job_id:
-            return json.dumps({"error": "No export job ID returned", "raw": job_data})
-
-        self._console.print(f"[dim]Polling export job {job_id}…[/dim]")
-        download_urls = self._canva.poll_export_until_done(job_id)
-
-        # Attach download URLs to matching DesignResult
-        for dr in self.design_results:
-            if dr.design_id == design_id:
-                dr.download_urls = download_urls
-                break
-
-        self._console.print(f"[green]Export ready:[/green] {len(download_urls)} file(s)")
-        return json.dumps({"design_id": design_id, "download_urls": download_urls})
-
     def _generate_etsy_listing(self, inp: dict) -> str:
-        design_title   = inp["design_title"]
-        design_format  = inp["design_format"]
-        design_style   = inp.get("design_style", "bold minimalist")
-        color_palette  = inp.get("color_palette", [])
-        mood_keywords  = inp.get("mood_keywords", [])
-        copy_suggestion = inp.get("copy_suggestion", "")
+        design_title    = inp["design_title"]
+        design_format   = inp["design_format"]
+        design_style    = inp.get("design_style", "bold minimalist")
+        color_palette   = inp.get("color_palette", [])
+        mood_keywords   = inp.get("mood_keywords", [])
+        copy_used       = inp.get("copy_used", "")
+        canva_url       = inp.get("canva_design_url", "")
 
         brief = self._brief
         etsy_tags = brief.etsy_tags if brief else research.TREND_DEFAULTS["etsy_fitness_tags"][:13]
@@ -384,25 +257,34 @@ class ToolExecutor:
             "instagram_landscape": "Instagram Landscape (1080×608)",
         }.get(design_format, "Instagram Template")
 
-        title = _build_etsy_title(design_title, design_style, format_label)
+        title       = _build_etsy_title(design_title, design_style, format_label)
         description = _build_etsy_description(
             design_title, format_label, design_style,
-            color_palette, mood_keywords, copy_suggestion, etsy_tags,
+            color_palette, mood_keywords, copy_used, etsy_tags,
         )
+
+        # Build shareable template URL (Canva's /copy suffix makes it copyable)
+        template_url = _make_template_url(canva_url)
 
         listing = EtsyListing(
             title=title,
             description=description,
             tags=etsy_tags[:13],
             suggested_price_usd=_suggest_price(design_format),
-            category="Digital Downloads > Printable Art",
+            category="Digital Downloads > Templates",
+            canva_template_url=template_url,
         )
 
-        # Attach to matching DesignResult
-        for dr in self.design_results:
-            if dr.title == design_title:
-                dr.etsy_listing = listing
-                break
+        # Store result
+        result = DesignResult(
+            title=design_title,
+            format=design_format,
+            canva_design_url=canva_url,
+            canva_template_url=template_url,
+            design_brief_summary=inp.get("design_style", ""),
+            etsy_listing=listing,
+        )
+        self.design_results.append(result)
 
         self._console.print(f"[green]Etsy listing:[/green] \"{title[:60]}…\"")
         return json.dumps({
@@ -411,34 +293,27 @@ class ToolExecutor:
             "tags": listing.tags,
             "suggested_price_usd": listing.suggested_price_usd,
             "category": listing.category,
+            "canva_template_url": listing.canva_template_url,
         })
 
 
 # ── Web search backend ─────────────────────────────────────────────────────────
 
 def _do_web_search(query: str) -> list[dict]:
-    """
-    Execute a web search using the configured provider.
-    Returns a list of result dicts with 'title', 'snippet', 'url' keys.
-    Falls back to an empty list if no API key is configured.
-    """
     provider = config.SEARCH_PROVIDER
     api_key  = config.SEARCH_API_KEY
 
     if not api_key:
-        # No API key — return a note so Claude can still proceed with defaults
         return [{"title": "No search API key configured",
                  "snippet": "Using built-in 2026 fitness design trend defaults.",
                  "url": ""}]
-
     if provider == "brave":
         return _brave_search(query, api_key)
     elif provider == "serpapi":
         return _serpapi_search(query, api_key)
-    else:
-        return [{"title": f"Unknown search provider: {provider}",
-                 "snippet": "Set SEARCH_PROVIDER=brave or serpapi in .env",
-                 "url": ""}]
+    return [{"title": f"Unknown search provider: {provider}",
+             "snippet": "Set SEARCH_PROVIDER=brave or serpapi in .env",
+             "url": ""}]
 
 
 def _brave_search(query: str, api_key: str) -> list[dict]:
@@ -478,8 +353,24 @@ def _serpapi_search(query: str, api_key: str) -> list[dict]:
 
 # ── Etsy copy helpers ──────────────────────────────────────────────────────────
 
+def _make_template_url(canva_url: str) -> str:
+    """
+    Convert a Canva design URL to a shareable template link.
+    Canva template links use the /copy path, which lets anyone copy
+    the design to their own Canva account when clicked.
+    If the URL already has /copy or is empty, return as-is.
+    """
+    if not canva_url:
+        return ""
+    if "/copy" in canva_url:
+        return canva_url
+    # Strip trailing slashes and query strings, append /copy
+    base = canva_url.split("?")[0].rstrip("/")
+    return base + "/copy"
+
+
 def _build_etsy_title(design_title: str, style: str, format_label: str) -> str:
-    raw = f"{design_title} | {style.title()} {format_label} | Fitness Printable Digital Download"
+    raw = f"{design_title} | {style.title()} Canva {format_label} Template | Fitness Influencer"
     return raw[:140]
 
 
@@ -494,48 +385,54 @@ def _build_etsy_description(
 ) -> str:
     palette_str = ", ".join(palette) if palette else "bold, high-contrast colors"
     mood_str    = ", ".join(mood) if mood else "energetic and powerful"
-    copy_line   = f'\n📣 Featured quote: "{copy_}"\n' if copy_ else ""
+    copy_line   = f'\n✏️ Featured quote: "{copy_}"\n' if copy_ else ""
     tag_line    = " | ".join(tags[:8])
 
-    return f"""✨ {title} — Instant Digital Download
+    return f"""✨ {title} — Instant Canva Template
 
-Transform your fitness content with this professionally designed {format_label} template, crafted in a {style} style to help you stand out on Instagram.
+Elevate your fitness brand with this professionally designed {format_label} Canva template, crafted in a {style} style for maximum impact on Instagram.
 
 {copy_line}
-📐 WHAT YOU GET
-• 1 high-resolution PNG file ({format_label})
-• Ready to upload directly to Instagram
-• Open in Canva via the included edit link to customize text, fonts, and colors
-• Perfect for fitness coaches, gym influencers, and personal trainers
+🎨 HOW IT WORKS (no design skills needed!)
+1. Purchase this listing
+2. You'll receive a link to your Canva template
+3. Click the link → Canva opens → click "Use template"
+4. The design is copied to YOUR Canva account
+5. Edit the text, colors, and fonts to match your brand
+6. Download and post to Instagram — done!
 
-🎨 DESIGN DETAILS
+✅ WHAT'S INCLUDED
+• 1 fully editable Canva template
+• Format: {format_label}
 • Style: {style.title()}
 • Color palette: {palette_str}
 • Mood: {mood_str}
+• Compatible with FREE Canva accounts
 
-📥 HOW IT WORKS
-1. Purchase and download your PNG file
-2. Use the Canva edit link (included in the file notes) to customize
-3. Export from Canva and post directly to Instagram
+📐 DESIGN DETAILS
+• Correct Instagram dimensions — no cropping needed
+• High-resolution output when downloaded from Canva
+• All fonts used are available in Canva's free library
+• Fully customizable: text, colors, images, fonts
 
-💼 COMMERCIAL USE
-This digital download is licensed for personal and small commercial use. Perfect for building your brand, client content packages, or reselling as part of a bundle.
+💼 COMMERCIAL USE INCLUDED
+Use this template for your own content, for clients, or include it in content packages. Reselling the template file itself is not permitted.
+
+📩 DELIVERY
+Your Canva template link is delivered instantly via Etsy's digital download system.
 
 🔍 Keywords: {tag_line}
 
 ⭐ Questions? Message me — I respond within 24 hours.
-
-© {_current_year()} — Digital download, no physical product will be shipped.
 """.strip()
 
 
 def _suggest_price(format_: str) -> float:
-    return {"instagram_story": 3.99, "instagram_post": 3.99, "instagram_landscape": 2.99}.get(format_, 3.99)
-
-
-def _current_year() -> int:
-    import datetime
-    return datetime.datetime.now().year
+    return {
+        "instagram_story":     4.99,
+        "instagram_post":      4.99,
+        "instagram_landscape": 3.99,
+    }.get(format_, 4.99)
 
 
 def _format_search_results(query: str, focus: str, results: list[dict]) -> str:
@@ -543,13 +440,3 @@ def _format_search_results(query: str, focus: str, results: list[dict]) -> str:
     for r in results:
         lines.append(f"  • {r['title']}: {r['snippet']}")
     return "\n".join(lines)
-
-
-def _dimensions_to_format(width: int, height: int) -> str:
-    if width == 1080 and height == 1920:
-        return "instagram_story"
-    if width == 1080 and height == 1080:
-        return "instagram_post"
-    if width == 1080 and height == 608:
-        return "instagram_landscape"
-    return f"custom_{width}x{height}"

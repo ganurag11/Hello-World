@@ -37,13 +37,13 @@ CANVA_API_BASE = "https://api.canva.com/rest/v1"
 CANVA_OAUTH_AUTHORIZE_URL = "https://www.canva.com/api/oauth/authorize"
 CANVA_OAUTH_TOKEN_URL = f"{CANVA_API_BASE}/oauth/token"
 
+# ── Canva AI Connector (MCP server) ──────────────────────────────────────────
+# This is the remote MCP server that lets Claude create actual designed content
+# in Canva via natural language prompts (not just blank canvases).
+CANVA_MCP_URL = "https://mcp.canva.com/mcp"
+
 # ── Rate-limit constants (per Canva docs) ─────────────────────────────────────
-CANVA_RATE_LIMIT_DESIGNS = 20     # requests per minute
-CANVA_RATE_LIMIT_EXPORTS = 20     # requests per minute
-CANVA_RATE_LIMIT_ASSETS  = 30     # requests per minute
-CANVA_MAX_RETRIES        = 3
-CANVA_EXPORT_POLL_INTERVAL = 3    # seconds between export status polls
-CANVA_EXPORT_MAX_WAIT      = 120  # seconds before giving up on an export
+CANVA_MAX_RETRIES = 3
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
