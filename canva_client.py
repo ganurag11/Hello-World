@@ -350,7 +350,7 @@ class CanvaClient:
     def poll_export_until_done(
         self,
         export_job_id: str,
-        max_wait_seconds: int = config.CANVA_EXPORT_MAX_WAIT,
+        max_wait_seconds: int = 120,
     ) -> list[str]:
         """
         Polls get_export_job() every CANVA_EXPORT_POLL_INTERVAL seconds until
@@ -372,7 +372,7 @@ class CanvaClient:
             if status == "failed":
                 error = job.get("job", {}).get("error", {})
                 raise CanvaAPIError(0, f"Export failed: {error}")
-            time.sleep(config.CANVA_EXPORT_POLL_INTERVAL)
+            time.sleep(3)
 
         raise CanvaExportTimeoutError(
             f"Export job {export_job_id} did not complete within {max_wait_seconds}s"

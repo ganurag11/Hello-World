@@ -17,7 +17,8 @@ import argparse
 import json
 import sys
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -56,7 +57,7 @@ to copy the design to their own Canva account, then customize and post to Instag
 ### Phase 2: Create Designs (use Canva tools)
 3. For EACH design, call the Canva tools to create a FULLY DESIGNED template.
    Describe every visual detail in your tool call:
-   - Exact pixel dimensions: Story=1080×1920, Post=1080×1080, Landscape=1080×608
+   - Exact pixel dimensions: Story=1080x1920, Post=1080x1080, Landscape=1080x608
    - Background color or gradient (from the brief's color_palette)
    - Motivational headline text (large, bold — from brief's copy_suggestions)
    - Font name and style (from brief's primary_font)
@@ -94,8 +95,8 @@ class FitnessDesignAgent:
             )
             sys.exit(1)
 
-        # Configure Gemini
-        genai.configure(api_key=config.GEMINI_API_KEY)
+        # Configure Gemini client (new google-genai SDK)
+        self._client = genai.Client(api_key=config.GEMINI_API_KEY)
 
         # Load Canva token
         self._canva_token = self._load_canva_token()
@@ -114,15 +115,15 @@ class FitnessDesignAgent:
         # Executor for our custom tools
         self._executor = ToolExecutor(console)
 
-        # Build Gemini model with ALL tools (ours + Canva MCP)
-        our_functions   = [_schema_to_gemini(t) for t in TOOLS]
-        all_functions   = our_functions + canva_functions
-        gemini_tools    = [{"function_declarations": all_functions}]
+        # Build tool declarations for Gemini
+        our_declarations    = [_schema_to_declaration(t) for t in TOOLS]
+        canva_declarations  = [_dict_to_declaration(f) for f in canva_functions]
+        all_declarations    = our_declarations + canva_declarations
 
-        self._model = genai.GenerativeModel(
-            model_name=config.GEMINI_MODEL,
-            tools=gemini_tools,
+        self._gemini_tools = [types.Tool(function_declarations=all_declarations)]
+        self._gen_config   = types.GenerateContentConfig(
             system_instruction=BASE_SYSTEM_PROMPT,
+            tools=self._gemini_tools,
         )
 
     def _load_canva_token(self) -> str:
@@ -138,44 +139,39 @@ class FitnessDesignAgent:
         sys.exit(1)
 
     def run(self, user_prompt: str) -> list[DesignResult]:
-        """
-        Agentic loop using Gemini function calling.
-
-        Gemini can call:
-          - Our custom tools (web search, synthesize brief, Etsy listing)
-            → dispatched by ToolExecutor
-          - Canva MCP tools (create design, etc.)
-            → dispatched to CanvaMCPClient
-        """
+        """Agentic loop using Gemini function calling (google-genai SDK)."""
         console.print(Panel(
             f"[bold cyan]Fitness Design Agent[/bold cyan] (Gemini)\n{user_prompt}",
             expand=False,
         ))
 
-        chat      = self._model.start_chat()
+        chat     = self._client.chats.create(
+            model=config.GEMINI_MODEL,
+            config=self._gen_config,
+        )
         response  = chat.send_message(user_prompt)
         iteration = 0
 
         while iteration < config.AGENT_MAX_ITERATIONS:
             iteration += 1
 
-            # Collect all function call parts from this response
+            # Collect all function call parts
             fn_calls = [
                 part.function_call
-                for part in response.parts
-                if hasattr(part, "function_call") and part.function_call.name
+                for part in response.candidates[0].content.parts
+                if part.function_call and part.function_call.name
             ]
 
             if not fn_calls:
-                # No more tool calls — print final text and stop
-                for part in response.parts:
-                    if hasattr(part, "text") and part.text:
+                # No tool calls — print final text and stop
+                for part in response.candidates[0].content.parts:
+                    if part.text:
                         console.print("\n" + part.text)
                 break
 
             console.print(f"\n[dim]--- Turn {iteration} ({len(fn_calls)} tool call(s)) ---[/dim]")
 
-            # Execute every function call and collect responses
+            # Execute all function calls and build response parts
             response_parts = []
             for fc in fn_calls:
                 name      = fc.name
@@ -191,15 +187,14 @@ class FitnessDesignAgent:
                     result_obj = _safe_json(result_str)
 
                 response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
+                    types.Part(
+                        function_response=types.FunctionResponse(
                             name=name,
                             response={"result": result_obj},
                         )
                     )
                 )
 
-            # Send all results back to Gemini in one turn
             response = chat.send_message(response_parts)
 
         if iteration >= config.AGENT_MAX_ITERATIONS:
@@ -231,16 +226,16 @@ def print_results_table(results: list[DesignResult]) -> None:
         table.add_column("Field", style="cyan", no_wrap=True)
         table.add_column("Value", style="white")
 
-        table.add_row("Format",          dr.format)
-        table.add_row("Canva URL",       dr.canva_design_url or "[dim]see output above[/dim]")
-        table.add_row("Template Link",   dr.canva_template_url or "[dim]set after Share as Template[/dim]")
+        table.add_row("Format",        dr.format)
+        table.add_row("Canva URL",     dr.canva_design_url or "[dim]see output above[/dim]")
+        table.add_row("Template Link", dr.canva_template_url or "[dim]set after Share as Template[/dim]")
 
         if dr.etsy_listing:
             el = dr.etsy_listing
             title_disp = el.title[:80] + "…" if len(el.title) > 80 else el.title
-            table.add_row("Etsy Title",  title_disp)
-            table.add_row("Price",       f"${el.suggested_price_usd:.2f}")
-            table.add_row("Tags",        ", ".join(el.tags[:6]) + "…")
+            table.add_row("Etsy Title", title_disp)
+            table.add_row("Price",      f"${el.suggested_price_usd:.2f}")
+            table.add_row("Tags",       ", ".join(el.tags[:6]) + "…")
 
         console.print(table)
         console.print()
@@ -279,9 +274,9 @@ def main() -> None:
         return
 
     format_label = {
-        "story":     "Instagram Stories (1080×1920)",
-        "post":      "square Instagram Posts (1080×1080)",
-        "landscape": "Instagram Landscape posts (1080×608)",
+        "story":     "Instagram Stories (1080x1920)",
+        "post":      "square Instagram Posts (1080x1080)",
+        "landscape": "Instagram Landscape posts (1080x608)",
         "mixed":     "a mix of Instagram Stories and Posts",
     }[args.format]
 
@@ -306,35 +301,58 @@ def main() -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _schema_to_gemini(tool: dict) -> dict:
-    """Convert our Anthropic-style tool schema to a Gemini function declaration."""
-    fn: dict = {
-        "name":        tool["name"],
-        "description": tool["description"],
-    }
+def _schema_to_declaration(tool: dict) -> types.FunctionDeclaration:
+    """Convert our tool schema dict to a Gemini FunctionDeclaration."""
     schema = tool.get("input_schema", {})
-    if schema:
-        fn["parameters"] = _strip_unsupported_keys(schema)
-    return fn
+    params = _build_schema(schema) if schema else None
+    return types.FunctionDeclaration(
+        name=tool["name"],
+        description=tool["description"],
+        parameters=params,
+    )
 
 
-def _strip_unsupported_keys(schema: dict) -> dict:
-    """Remove JSON Schema keys Gemini doesn't accept."""
-    allowed = {"type", "description", "properties", "required", "items",
-               "enum", "minimum", "maximum", "default"}
-    cleaned = {k: v for k, v in schema.items() if k in allowed}
-    if "properties" in cleaned:
-        cleaned["properties"] = {
-            k: _strip_unsupported_keys(v)
-            for k, v in cleaned["properties"].items()
-        }
-    if "items" in cleaned:
-        cleaned["items"] = _strip_unsupported_keys(cleaned["items"])
-    return cleaned
+def _dict_to_declaration(fn: dict) -> types.FunctionDeclaration:
+    """Convert a Canva MCP function dict to a Gemini FunctionDeclaration."""
+    params = _build_schema(fn["parameters"]) if fn.get("parameters") else None
+    return types.FunctionDeclaration(
+        name=fn["name"],
+        description=fn.get("description", ""),
+        parameters=params,
+    )
+
+
+def _build_schema(schema: dict) -> types.Schema:
+    """Recursively convert a JSON Schema dict to a Gemini Schema object."""
+    type_map = {
+        "object":  types.Type.OBJECT,
+        "string":  types.Type.STRING,
+        "integer": types.Type.INTEGER,
+        "number":  types.Type.NUMBER,
+        "boolean": types.Type.BOOLEAN,
+        "array":   types.Type.ARRAY,
+    }
+    gemini_type = type_map.get(schema.get("type", "object"), types.Type.OBJECT)
+
+    properties = None
+    if "properties" in schema:
+        properties = {k: _build_schema(v) for k, v in schema["properties"].items()}
+
+    items = None
+    if "items" in schema:
+        items = _build_schema(schema["items"])
+
+    return types.Schema(
+        type=gemini_type,
+        description=schema.get("description", ""),
+        properties=properties,
+        required=schema.get("required"),
+        items=items,
+        enum=schema.get("enum"),
+    )
 
 
 def _safe_json(s: str) -> dict | str:
-    """Parse JSON string to dict; return raw string on failure."""
     try:
         return json.loads(s)
     except Exception:
