@@ -1,14 +1,17 @@
 """
-Canva Fitness Design Agent — Gemini edition.
+Canva Fitness Design Agent — Gemini + Canva Connect API edition.
 
-Uses Google's Gemini API for reasoning and the Canva AI Connector MCP server
-for actual design creation. Gemini calls our custom research tools AND the
-Canva MCP tools (discovered dynamically) in a single agentic loop.
+Workflow:
+  1. Gemini researches 2026 fitness design trends via web search
+  2. Synthesizes a design brief (colors, fonts, copy, Etsy tags)
+  3. Creates blank Canva canvases at exact Instagram dimensions (REST API)
+  4. Generates a detailed per-design brief: what to add in Canva
+  5. Writes full Etsy listings for every design
 
 Usage:
-    python agent.py --oauth                              # First-time Canva setup
-    python agent.py                                      # Run with defaults
-    python agent.py "Create 5 dark gym story templates" --count 5 --format story
+    python agent.py --oauth                    # First-time Canva authorization
+    python agent.py --count 3 --format story   # Create 3 story templates
+    python agent.py "Create gym motivation designs" --count 5
 """
 
 from __future__ import annotations
@@ -25,61 +28,57 @@ from rich.table import Table
 from rich import box
 
 import config
-from canva_client import load_cached_tokens, run_oauth_flow
-from canva_mcp import CanvaMCPClient, CanvaMCPConnectionError
+from canva_client import client_from_cache, load_cached_tokens, run_oauth_flow
 from tools import TOOLS, ToolExecutor, DesignResult
 
 console = Console()
-
-# Names of tools we handle ourselves (everything else goes to Canva MCP)
-OUR_TOOLS = {"web_search_fitness_trends", "synthesize_design_brief", "generate_etsy_listing"}
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 BASE_SYSTEM_PROMPT = """\
-You are an expert fitness design consultant and Canva template creator.
-Your mission: create stunning, fully designed Instagram Canva templates for
-fitness influencers to sell as digital downloads on Etsy.
+You are an expert fitness design consultant creating Instagram Canva templates
+for fitness influencers to sell on Etsy.
 
-Customers buy these on Etsy, receive a shareable Canva template link, click it
-to copy the design to their own Canva account, then customize and post to Instagram.
+You create blank Canva canvases at the correct dimensions, then provide a
+detailed creative brief for each one so the user knows EXACTLY what to add.
 
 ## MANDATORY WORKFLOW — follow this order exactly
 
-### Phase 1: Research (always do this first)
-1. Call web_search_fitness_trends at least TWICE with different queries:
-   - First: focus "color_trends" or "typography"
-   - Second: focus "etsy_strategy" or "competitor_analysis"
-2. Call synthesize_design_brief ONCE with ALL search result summaries.
-   Use the returned brief (colors, fonts, copy) for every design decision below.
+### Phase 1: Research
+1. Call web_search_fitness_trends at least TWICE:
+   - First call: focus "color_trends" or "typography"
+   - Second call: focus "etsy_strategy" or "competitor_analysis"
+2. Call synthesize_design_brief ONCE with all search summaries.
 
-### Phase 2: Create Designs (use Canva tools)
-3. For EACH design, call the Canva tools to create a FULLY DESIGNED template.
-   Describe every visual detail in your tool call:
-   - Exact pixel dimensions: Story=1080x1920, Post=1080x1080, Landscape=1080x608
-   - Background color or gradient (from the brief's color_palette)
-   - Motivational headline text (large, bold — from brief's copy_suggestions)
-   - Font name and style (from brief's primary_font)
-   - Any supporting elements (subtext, icons, dividers, shapes)
-   - Overall mood and theme
+### Phase 2: Create Canvases
+3. For each design, call canva_create_design with:
+   - A unique, evocative title
+   - Exact dimensions: Story=1080x1920, Post=1080x1080, Landscape=1080x608
 
-4. After Canva creates each design you will receive a design URL — save it.
+### Phase 3: Design Briefs
+4. For each canvas, call generate_design_brief with SPECIFIC details:
+   - background: exact hex color or gradient (e.g. "#1A1A2E to #000000 gradient")
+   - headline: the exact motivational text (e.g. "NO DAYS OFF")
+   - headline_font: font name, size, color, position (e.g. "Bebas Neue, 120px, white, centered")
+   - subtext: supporting line (e.g. "Train hard. Stay consistent.")
+   - accent_elements: shapes/lines to add (e.g. "thin orange #FF4500 line at 65% height")
+   - mood: overall feel (e.g. "dark, powerful, motivational")
+   Each design must have a DIFFERENT concept — vary colors, copy, and mood.
 
-### Phase 3: Etsy Listings
-5. For EACH design call generate_etsy_listing with:
-   - The design's title, format, style details
-   - The canva_design_url returned by Canva
+### Phase 4: Etsy Listings
+5. For each design, call generate_etsy_listing.
 
-### Phase 4: Final Summary
-6. List every design with its Canva URL, Etsy title, tags, and price.
-   Include instructions: open URL → Share as Template in Canva → list on Etsy.
+### Phase 5: Final Summary
+6. Print a clear summary table with for each design:
+   - Title and Canva edit URL
+   - The complete design brief (what to add step by step)
+   - Etsy listing title and tags
 
-## Design quality rules
-- Each design must look COMPLETE — no placeholder text
-- Vary the concept for each template (different mood, layout, headline)
-- Bold and high-contrast — must grab attention in Instagram feeds
-- Use SPECIFIC colors from the DesignBrief (not generic "dark colors")
+## Quality rules
+- Use SPECIFIC hex colors from the research brief — not "dark blue"
+- Each headline must be a real motivational fitness phrase
+- Vary every design: different background, headline, mood
 """
 
 
@@ -89,73 +88,34 @@ class FitnessDesignAgent:
     def __init__(self):
         missing = config.validate()
         if missing:
-            console.print(
-                f"[red]Missing required config:[/red] {', '.join(missing)}\n"
-                "Copy .env.example to .env and fill in the values."
-            )
+            console.print(f"[red]Missing config:[/red] {', '.join(missing)}\n"
+                          "Fill in your .env file.")
             sys.exit(1)
 
-        # Configure Gemini client (new google-genai SDK)
-        self._client = genai.Client(api_key=config.GEMINI_API_KEY)
+        self._gemini  = genai.Client(api_key=config.GEMINI_API_KEY)
+        self._canva   = client_from_cache()
+        self._executor = ToolExecutor(self._canva, console)
 
-        # Load Canva token
-        self._canva_token = self._load_canva_token()
-
-        # Connect to Canva MCP server and discover its tools
-        console.print("[dim]Connecting to Canva AI Connector…[/dim]")
-        self._canva_mcp = CanvaMCPClient(self._canva_token)
-        try:
-            canva_functions = self._canva_mcp.to_gemini_functions()
-            console.print(f"[green]Canva MCP connected:[/green] {len(canva_functions)} tools available")
-        except CanvaMCPConnectionError as exc:
-            console.print(f"[red]Cannot connect to Canva MCP:[/red] {exc}")
-            console.print("Run [bold]python agent.py --oauth[/bold] to authorize with Canva first.")
-            sys.exit(1)
-
-        # Executor for our custom tools
-        self._executor = ToolExecutor(console)
-
-        # Build tool declarations for Gemini
-        our_declarations    = [_schema_to_declaration(t) for t in TOOLS]
-        canva_declarations  = [_dict_to_declaration(f) for f in canva_functions]
-        all_declarations    = our_declarations + canva_declarations
-
-        self._gemini_tools = [types.Tool(function_declarations=all_declarations)]
-        self._gen_config   = types.GenerateContentConfig(
+        declarations = [_to_declaration(t) for t in TOOLS]
+        self._gen_config = types.GenerateContentConfig(
             system_instruction=BASE_SYSTEM_PROMPT,
-            tools=self._gemini_tools,
+            tools=[types.Tool(function_declarations=declarations)],
         )
-
-    def _load_canva_token(self) -> str:
-        tokens = load_cached_tokens()
-        if tokens and tokens.get("access_token"):
-            return tokens["access_token"]
-        if config.CANVA_ACCESS_TOKEN:
-            return config.CANVA_ACCESS_TOKEN
-        console.print(
-            "[yellow]No Canva access token found.[/yellow]\n"
-            "Run [bold]python agent.py --oauth[/bold] first."
-        )
-        sys.exit(1)
 
     def run(self, user_prompt: str) -> list[DesignResult]:
-        """Agentic loop using Gemini function calling (google-genai SDK)."""
         console.print(Panel(
-            f"[bold cyan]Fitness Design Agent[/bold cyan] (Gemini)\n{user_prompt}",
+            f"[bold cyan]Fitness Design Agent[/bold cyan] (Gemini + Canva)\n{user_prompt}",
             expand=False,
         ))
 
-        chat     = self._client.chats.create(
-            model=config.GEMINI_MODEL,
-            config=self._gen_config,
-        )
-        response  = chat.send_message(user_prompt)
+        chat     = self._gemini.chats.create(model=config.GEMINI_MODEL,
+                                             config=self._gen_config)
+        response = chat.send_message(user_prompt)
         iteration = 0
 
         while iteration < config.AGENT_MAX_ITERATIONS:
             iteration += 1
 
-            # Collect all function call parts
             fn_calls = [
                 part.function_call
                 for part in response.candidates[0].content.parts
@@ -163,90 +123,78 @@ class FitnessDesignAgent:
             ]
 
             if not fn_calls:
-                # No tool calls — print final text and stop
                 for part in response.candidates[0].content.parts:
                     if part.text:
                         console.print("\n" + part.text)
                 break
 
-            console.print(f"\n[dim]--- Turn {iteration} ({len(fn_calls)} tool call(s)) ---[/dim]")
+            console.print(f"\n[dim]--- Turn {iteration} ({len(fn_calls)} tool(s)) ---[/dim]")
 
-            # Execute all function calls and build response parts
             response_parts = []
             for fc in fn_calls:
-                name      = fc.name
-                arguments = dict(fc.args)
-
-                if name in OUR_TOOLS:
-                    console.print(f"[bold yellow]→ Tool:[/bold yellow] {name}")
-                    result_str = self._executor.execute(name, arguments)
-                    result_obj = _safe_json(result_str)
-                else:
-                    console.print(f"[bold magenta]→ Canva:[/bold magenta] {name}")
-                    result_str = self._canva_mcp.call_tool(name, arguments)
-                    result_obj = _safe_json(result_str)
-
-                response_parts.append(
-                    types.Part(
-                        function_response=types.FunctionResponse(
-                            name=name,
-                            response={"result": result_obj},
-                        )
+                console.print(f"[bold yellow]→[/bold yellow] {fc.name}")
+                result_str = self._executor.execute(fc.name, dict(fc.args))
+                response_parts.append(types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fc.name,
+                        response={"result": _safe_json(result_str)},
                     )
-                )
+                ))
 
             response = chat.send_message(response_parts)
 
         if iteration >= config.AGENT_MAX_ITERATIONS:
-            console.print("[red]Max iterations reached — agent stopped.[/red]")
+            console.print("[red]Max iterations reached.[/red]")
 
         return self._executor.design_results
 
 
 # ── Output ────────────────────────────────────────────────────────────────────
 
-def print_results_table(results: list[DesignResult]) -> None:
+def print_results(results: list[DesignResult]) -> None:
     if not results:
-        console.print(
-            "\n[yellow]No designs recorded via generate_etsy_listing.[/yellow]\n"
-            "Check the output above for Canva design URLs."
-        )
+        console.print("\n[yellow]No designs recorded — check output above for details.[/yellow]")
         return
 
-    console.print("\n")
-    console.rule("[bold green]Design Results[/bold green]")
+    console.rule("[bold green]Your Designs[/bold green]")
 
     for i, dr in enumerate(results, 1):
-        table = Table(
-            title=f"Design {i}: {dr.title}",
-            box=box.ROUNDED,
-            show_header=False,
-            padding=(0, 1),
-        )
+        table = Table(title=f"Design {i}: {dr.title}",
+                      box=box.ROUNDED, show_header=False, padding=(0, 1))
         table.add_column("Field", style="cyan", no_wrap=True)
         table.add_column("Value", style="white")
 
-        table.add_row("Format",        dr.format)
-        table.add_row("Canva URL",     dr.canva_design_url or "[dim]see output above[/dim]")
-        table.add_row("Template Link", dr.canva_template_url or "[dim]set after Share as Template[/dim]")
+        table.add_row("Format",   f"{dr.format} ({dr.width}×{dr.height})")
+        table.add_row("Edit URL", dr.edit_url or "[dim]not available[/dim]")
+
+        if dr.design_brief:
+            b = dr.design_brief
+            table.add_row("─── In Canva, add:", "─────────────────────────────")
+            table.add_row("Background",  b.background)
+            table.add_row("Headline",    f'"{b.headline}" — {b.headline_font}')
+            table.add_row("Subtext",     f'"{b.subtext}" — {b.subtext_font}')
+            table.add_row("Accents",     b.accent_elements)
+            table.add_row("Mood",        b.mood)
 
         if dr.etsy_listing:
             el = dr.etsy_listing
-            title_disp = el.title[:80] + "…" if len(el.title) > 80 else el.title
-            table.add_row("Etsy Title", title_disp)
-            table.add_row("Price",      f"${el.suggested_price_usd:.2f}")
-            table.add_row("Tags",       ", ".join(el.tags[:6]) + "…")
+            table.add_row("─── Etsy Listing:", "─────────────────────────────")
+            title_disp = el.title[:75] + "…" if len(el.title) > 75 else el.title
+            table.add_row("Title",  title_disp)
+            table.add_row("Price",  f"${el.suggested_price_usd:.2f}")
+            table.add_row("Tags",   ", ".join(el.tags[:7]) + "…")
 
         console.print(table)
         console.print()
 
-    console.rule("[bold green]Etsy Selling Steps[/bold green]")
+    console.rule("[bold green]Next Steps[/bold green]")
     console.print(
-        "1. Open each [cyan]Canva URL[/cyan] in your browser\n"
-        "2. Canva → [bold]Share → Share as Template[/bold] → copy the link\n"
-        "3. Create Etsy listing with the generated title, description, tags\n"
-        "4. Add template link as a .txt digital download file\n"
-        "5. Screenshot the design as your listing photo\n"
+        "For each design:\n"
+        "1. Click the [cyan]Edit URL[/cyan] to open in Canva\n"
+        "2. Follow the brief above to add background, text, and accents\n"
+        "3. Download as PNG from Canva\n"
+        "4. List on Etsy using the generated title, description, and tags\n"
+        "5. Upload the PNG as both the listing photo and digital download file\n"
     )
 
 
@@ -254,96 +202,61 @@ def print_results_table(results: list[DesignResult]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Canva Fitness Design Agent (Gemini) — create Instagram Canva templates for Etsy",
+        description="Canva Fitness Design Agent — create Instagram templates for Etsy"
     )
-    parser.add_argument("prompt", nargs="?", default=None,
-                        help="Design request in plain English")
-    parser.add_argument("--format", choices=["story", "post", "landscape", "mixed"],
-                        default="mixed")
-    parser.add_argument("--count", type=int, default=5,
-                        help="Number of designs (1–10, default 5)")
-    parser.add_argument("--oauth", action="store_true",
+    parser.add_argument("prompt",   nargs="?", default=None)
+    parser.add_argument("--format", choices=["story","post","landscape","mixed"], default="mixed")
+    parser.add_argument("--count",  type=int, default=5)
+    parser.add_argument("--oauth",  action="store_true",
                         help="Authorize with Canva (run once before first use)")
     args = parser.parse_args()
 
     if args.oauth:
-        console.print("[bold cyan]Starting Canva OAuth flow…[/bold cyan]")
+        console.print("[bold cyan]Starting Canva OAuth…[/bold cyan]")
         run_oauth_flow()
-        console.print(f"\n[green]Done![/green] Tokens saved to: {config.TOKEN_CACHE_PATH}")
-        console.print("You can now run the agent without [bold]--oauth[/bold].")
+        console.print(f"\n[green]Done![/green] Tokens saved to {config.TOKEN_CACHE_PATH}")
         return
 
     format_label = {
-        "story":     "Instagram Stories (1080x1920)",
-        "post":      "square Instagram Posts (1080x1080)",
-        "landscape": "Instagram Landscape posts (1080x608)",
+        "story":     "Instagram Stories (1080×1920)",
+        "post":      "square Instagram Posts (1080×1080)",
+        "landscape": "Instagram Landscape posts (1080×608)",
         "mixed":     "a mix of Instagram Stories and Posts",
     }[args.format]
 
-    format_key = {
-        "story": "instagram_story", "post": "instagram_post",
-        "landscape": "instagram_landscape", "mixed": "mixed",
-    }[args.format]
-
-    count = max(1, min(10, args.count))
-
+    count  = max(1, min(10, args.count))
     prompt = args.prompt or (
         f"Research 2026 fitness influencer design trends, then create {count} "
-        f"fully designed Canva templates for {format_label}. "
-        f"Make them bold, motivational, and ready to sell as Canva templates on Etsy. "
-        f"Design format: {format_key}."
+        f"Canva templates for {format_label}. Make them bold, motivational, "
+        f"and ready to sell as digital templates on Etsy."
     )
 
     agent   = FitnessDesignAgent()
     results = agent.run(prompt)
-    print_results_table(results)
+    print_results(results)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _schema_to_declaration(tool: dict) -> types.FunctionDeclaration:
-    """Convert our tool schema dict to a Gemini FunctionDeclaration."""
+def _to_declaration(tool: dict) -> types.FunctionDeclaration:
     schema = tool.get("input_schema", {})
-    params = _build_schema(schema) if schema else None
     return types.FunctionDeclaration(
         name=tool["name"],
         description=tool["description"],
-        parameters=params,
-    )
-
-
-def _dict_to_declaration(fn: dict) -> types.FunctionDeclaration:
-    """Convert a Canva MCP function dict to a Gemini FunctionDeclaration."""
-    params = _build_schema(fn["parameters"]) if fn.get("parameters") else None
-    return types.FunctionDeclaration(
-        name=fn["name"],
-        description=fn.get("description", ""),
-        parameters=params,
+        parameters=_build_schema(schema) if schema else None,
     )
 
 
 def _build_schema(schema: dict) -> types.Schema:
-    """Recursively convert a JSON Schema dict to a Gemini Schema object."""
     type_map = {
-        "object":  types.Type.OBJECT,
-        "string":  types.Type.STRING,
-        "integer": types.Type.INTEGER,
-        "number":  types.Type.NUMBER,
-        "boolean": types.Type.BOOLEAN,
-        "array":   types.Type.ARRAY,
+        "object": types.Type.OBJECT, "string": types.Type.STRING,
+        "integer": types.Type.INTEGER, "number": types.Type.NUMBER,
+        "boolean": types.Type.BOOLEAN, "array": types.Type.ARRAY,
     }
-    gemini_type = type_map.get(schema.get("type", "object"), types.Type.OBJECT)
-
-    properties = None
-    if "properties" in schema:
-        properties = {k: _build_schema(v) for k, v in schema["properties"].items()}
-
-    items = None
-    if "items" in schema:
-        items = _build_schema(schema["items"])
-
+    properties = {k: _build_schema(v) for k, v in schema.get("properties", {}).items()} or None
+    items = _build_schema(schema["items"]) if "items" in schema else None
     return types.Schema(
-        type=gemini_type,
+        type=type_map.get(schema.get("type", "object"), types.Type.OBJECT),
         description=schema.get("description", ""),
         properties=properties,
         required=schema.get("required"),
