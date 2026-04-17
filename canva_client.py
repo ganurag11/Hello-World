@@ -94,9 +94,13 @@ def _exchange_code_for_token(
             "client_secret": client_secret,
             "redirect_uri": redirect_uri,
         },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        print(f"\n[Canva token error] Status: {resp.status_code}")
+        print(f"[Canva token error] Body: {resp.text}\n")
+        resp.raise_for_status()
     return resp.json()
 
 
@@ -134,7 +138,7 @@ def run_oauth_flow() -> dict:
             pass
 
     port = int(urllib.parse.urlparse(config.CANVA_REDIRECT_URI).port or 8080)
-    server = http.server.HTTPServer(("localhost", port), _Handler)
+    server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
 
     print(f"\nOpening Canva authorization in your browser...")
     print(f"If it doesn't open automatically, visit:\n  {auth_url}\n")
