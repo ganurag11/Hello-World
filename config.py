@@ -33,22 +33,16 @@ CANVA_SCOPES: list[str] = [
 ]
 
 # ── Canva API endpoints ───────────────────────────────────────────────────────
-CANVA_API_BASE = "https://api.canva.com/rest/v1"
+CANVA_API_BASE            = "https://api.canva.com/rest/v1"
 CANVA_OAUTH_AUTHORIZE_URL = "https://www.canva.com/api/oauth/authorize"
-CANVA_OAUTH_TOKEN_URL = f"{CANVA_API_BASE}/oauth/token"
+CANVA_OAUTH_TOKEN_URL     = f"{CANVA_API_BASE}/oauth/token"
+CANVA_MCP_URL             = "https://mcp.canva.com/mcp"
 
-# ── Canva AI Connector (MCP server) ──────────────────────────────────────────
-# This is the remote MCP server that lets Claude create actual designed content
-# in Canva via natural language prompts (not just blank canvases).
-CANVA_MCP_URL = "https://mcp.canva.com/mcp"
-
-# ── Rate-limit constants (per Canva docs) ─────────────────────────────────────
 CANVA_MAX_RETRIES = 3
 
-# ── Anthropic ─────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-6"
-AGENT_MAX_TOKENS = 4096
+# ── Gemini (Google AI) ────────────────────────────────────────────────────────
+GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL        = "gemini-2.0-flash"   # fast + supports function calling
 AGENT_MAX_ITERATIONS = 30
 
 # ── Canva OAuth credentials ───────────────────────────────────────────────────
@@ -58,7 +52,7 @@ CANVA_ACCESS_TOKEN:  str = os.environ.get("CANVA_ACCESS_TOKEN", "")
 CANVA_REFRESH_TOKEN: str = os.environ.get("CANVA_REFRESH_TOKEN", "")
 CANVA_REDIRECT_URI:  str = os.environ.get("CANVA_REDIRECT_URI", "http://localhost:8080/callback")
 
-# ── Web search ────────────────────────────────────────────────────────────────
+# ── Web search (optional) ─────────────────────────────────────────────────────
 SEARCH_API_KEY:  str = os.environ.get("SEARCH_API_KEY", "")
 SEARCH_PROVIDER: str = os.environ.get("SEARCH_PROVIDER", "brave")  # "brave" | "serpapi"
 
@@ -67,10 +61,10 @@ TOKEN_CACHE_PATH: str = os.path.expanduser("~/.canva_agent_tokens.json")
 
 
 def validate() -> list[str]:
-    """Return a list of missing required config keys (empty means all good)."""
+    """Return a list of missing required config keys (empty list = all good)."""
     missing = []
-    if not ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
+    if not GEMINI_API_KEY:
+        missing.append("GEMINI_API_KEY")
     if not CANVA_CLIENT_ID:
         missing.append("CANVA_CLIENT_ID")
     if not CANVA_CLIENT_SECRET:
