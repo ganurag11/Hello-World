@@ -19,8 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from rich.console import Console
 from rich.panel import Panel
@@ -110,7 +112,7 @@ class FitnessDesignAgent:
 
         chat     = self._gemini.chats.create(model=config.GEMINI_MODEL,
                                              config=self._gen_config)
-        response = chat.send_message(user_prompt)
+        response = _send_with_retry(chat, user_prompt)
         iteration = 0
 
         while iteration < config.AGENT_MAX_ITERATIONS:
@@ -141,7 +143,7 @@ class FitnessDesignAgent:
                     )
                 ))
 
-            response = chat.send_message(response_parts)
+            response = _send_with_retry(chat, response_parts)
 
         if iteration >= config.AGENT_MAX_ITERATIONS:
             console.print("[red]Max iterations reached.[/red]")
@@ -263,6 +265,21 @@ def _build_schema(schema: dict) -> types.Schema:
         items=items,
         enum=schema.get("enum"),
     )
+
+
+def _send_with_retry(chat, message, max_retries: int = 4) -> object:
+    """Send a Gemini message, retrying on 429 rate-limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return chat.send_message(message)
+        except genai_errors.ClientError as exc:
+            if exc.status_code == 429 and attempt < max_retries - 1:
+                wait = 30 * (attempt + 1)   # 30s, 60s, 90s
+                console.print(f"[yellow]Rate limited — waiting {wait}s…[/yellow]")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Max retries exceeded")
 
 
 def _safe_json(s: str) -> dict | str:
