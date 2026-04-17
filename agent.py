@@ -273,9 +273,10 @@ def _send_with_retry(chat, message, max_retries: int = 4) -> object:
         try:
             return chat.send_message(message)
         except genai_errors.ClientError as exc:
-            if exc.status_code == 429 and attempt < max_retries - 1:
+            is_rate_limit = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+            if is_rate_limit and attempt < max_retries - 1:
                 wait = 30 * (attempt + 1)   # 30s, 60s, 90s
-                console.print(f"[yellow]Rate limited — waiting {wait}s…[/yellow]")
+                console.print(f"[yellow]Rate limited — waiting {wait}s then retrying…[/yellow]")
                 time.sleep(wait)
             else:
                 raise

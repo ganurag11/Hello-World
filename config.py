@@ -42,7 +42,7 @@ CANVA_MAX_RETRIES = 3
 
 # ── Gemini (Google AI) ────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL        = "gemini-1.5-flash"   # free tier compatible
+GEMINI_MODEL        = "gemini-1.5-flash-latest"   # free tier compatible
 AGENT_MAX_ITERATIONS = 30
 
 # ── Canva OAuth credentials ───────────────────────────────────────────────────
