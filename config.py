@@ -42,7 +42,7 @@ CANVA_MAX_RETRIES = 3
 
 # ── Anthropic (Claude) ────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL        = "claude-3-5-sonnet-20241022"
+ANTHROPIC_MODEL        = "claude-haiku-4-5-20251001"
 AGENT_MAX_ITERATIONS   = 30
 
 # ── Canva OAuth credentials ───────────────────────────────────────────────────
