@@ -94,7 +94,10 @@ class FitnessDesignAgent:
                           "Fill in your .env file.")
             sys.exit(1)
 
-        self._gemini  = genai.Client(api_key=config.GEMINI_API_KEY)
+        self._gemini  = genai.Client(
+            api_key=config.GEMINI_API_KEY,
+            http_options=types.HttpOptions(api_version="v1"),
+        )
         self._canva   = client_from_cache()
         self._executor = ToolExecutor(self._canva, console)
 
