@@ -1,8 +1,8 @@
 """
-Canva Fitness Design Agent — Gemini + Canva Connect API edition.
+Canva Fitness Design Agent — Claude + Canva Connect API edition.
 
 Workflow:
-  1. Gemini researches 2026 fitness design trends via web search
+  1. Claude researches 2026 fitness design trends via web search
   2. Synthesizes a design brief (colors, fonts, copy, Etsy tags)
   3. Creates blank Canva canvases at exact Instagram dimensions (REST API)
   4. Generates a detailed per-design brief: what to add in Canva
@@ -17,20 +17,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-import time
 
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
+import anthropic
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
 import config
-from canva_client import client_from_cache, load_cached_tokens, run_oauth_flow
+from canva_client import client_from_cache, run_oauth_flow
 from tools import TOOLS, ToolExecutor, DesignResult
 
 console = Console()
@@ -94,56 +90,57 @@ class FitnessDesignAgent:
                           "Fill in your .env file.")
             sys.exit(1)
 
-        self._gemini  = genai.Client(api_key=config.GEMINI_API_KEY)
-        self._canva   = client_from_cache()
+        self._client   = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        self._canva    = client_from_cache()
         self._executor = ToolExecutor(self._canva, console)
-
-        declarations = [_to_declaration(t) for t in TOOLS]
-        self._gen_config = types.GenerateContentConfig(
-            system_instruction=BASE_SYSTEM_PROMPT,
-            tools=[types.Tool(function_declarations=declarations)],
-        )
 
     def run(self, user_prompt: str) -> list[DesignResult]:
         console.print(Panel(
-            f"[bold cyan]Fitness Design Agent[/bold cyan] (Gemini + Canva)\n{user_prompt}",
+            f"[bold cyan]Fitness Design Agent[/bold cyan] (Claude + Canva)\n{user_prompt}",
             expand=False,
         ))
 
-        chat     = self._gemini.chats.create(model=config.GEMINI_MODEL,
-                                             config=self._gen_config)
-        response = _send_with_retry(chat, user_prompt)
+        messages = [{"role": "user", "content": user_prompt}]
         iteration = 0
 
         while iteration < config.AGENT_MAX_ITERATIONS:
             iteration += 1
 
-            fn_calls = [
-                part.function_call
-                for part in response.candidates[0].content.parts
-                if part.function_call and part.function_call.name
-            ]
+            response = self._client.messages.create(
+                model=config.ANTHROPIC_MODEL,
+                max_tokens=8096,
+                system=BASE_SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
 
-            if not fn_calls:
-                for part in response.candidates[0].content.parts:
-                    if part.text:
-                        console.print("\n" + part.text)
+            # Append assistant turn
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason == "end_turn":
+                for block in response.content:
+                    if hasattr(block, "text") and block.text:
+                        console.print("\n" + block.text)
                 break
 
-            console.print(f"\n[dim]--- Turn {iteration} ({len(fn_calls)} tool(s)) ---[/dim]")
+            if response.stop_reason != "tool_use":
+                console.print(f"[yellow]Unexpected stop_reason: {response.stop_reason}[/yellow]")
+                break
 
-            response_parts = []
-            for fc in fn_calls:
-                console.print(f"[bold yellow]→[/bold yellow] {fc.name}")
-                result_str = self._executor.execute(fc.name, dict(fc.args))
-                response_parts.append(types.Part(
-                    function_response=types.FunctionResponse(
-                        name=fc.name,
-                        response={"result": _safe_json(result_str)},
-                    )
-                ))
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            console.print(f"\n[dim]--- Turn {iteration} ({len(tool_uses)} tool(s)) ---[/dim]")
 
-            response = _send_with_retry(chat, response_parts)
+            tool_results = []
+            for tu in tool_uses:
+                console.print(f"[bold yellow]→[/bold yellow] {tu.name}")
+                result_str = self._executor.execute(tu.name, dict(tu.input))
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": result_str,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
 
         if iteration >= config.AGENT_MAX_ITERATIONS:
             console.print("[red]Max iterations reached.[/red]")
@@ -194,9 +191,8 @@ def print_results(results: list[DesignResult]) -> None:
         "For each design:\n"
         "1. Click the [cyan]Edit URL[/cyan] to open in Canva\n"
         "2. Follow the brief above to add background, text, and accents\n"
-        "3. Download as PNG from Canva\n"
+        "3. Share the Canva template link with your Etsy customers\n"
         "4. List on Etsy using the generated title, description, and tags\n"
-        "5. Upload the PNG as both the listing photo and digital download file\n"
     )
 
 
@@ -236,58 +232,6 @@ def main() -> None:
     agent   = FitnessDesignAgent()
     results = agent.run(prompt)
     print_results(results)
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _to_declaration(tool: dict) -> types.FunctionDeclaration:
-    schema = tool.get("input_schema", {})
-    return types.FunctionDeclaration(
-        name=tool["name"],
-        description=tool["description"],
-        parameters=_build_schema(schema) if schema else None,
-    )
-
-
-def _build_schema(schema: dict) -> types.Schema:
-    type_map = {
-        "object": types.Type.OBJECT, "string": types.Type.STRING,
-        "integer": types.Type.INTEGER, "number": types.Type.NUMBER,
-        "boolean": types.Type.BOOLEAN, "array": types.Type.ARRAY,
-    }
-    properties = {k: _build_schema(v) for k, v in schema.get("properties", {}).items()} or None
-    items = _build_schema(schema["items"]) if "items" in schema else None
-    return types.Schema(
-        type=type_map.get(schema.get("type", "object"), types.Type.OBJECT),
-        description=schema.get("description", ""),
-        properties=properties,
-        required=schema.get("required"),
-        items=items,
-        enum=schema.get("enum"),
-    )
-
-
-def _send_with_retry(chat, message, max_retries: int = 4) -> object:
-    """Send a Gemini message, retrying on 429 rate-limit errors."""
-    for attempt in range(max_retries):
-        try:
-            return chat.send_message(message)
-        except genai_errors.ClientError as exc:
-            is_rate_limit = "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
-            if is_rate_limit and attempt < max_retries - 1:
-                wait = 30 * (attempt + 1)   # 30s, 60s, 90s
-                console.print(f"[yellow]Rate limited — waiting {wait}s then retrying…[/yellow]")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("Max retries exceeded")
-
-
-def _safe_json(s: str) -> dict | str:
-    try:
-        return json.loads(s)
-    except Exception:
-        return s
 
 
 if __name__ == "__main__":

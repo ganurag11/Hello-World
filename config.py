@@ -40,17 +40,17 @@ CANVA_MCP_URL             = "https://mcp.canva.com/mcp"
 
 CANVA_MAX_RETRIES = 3
 
-# ── Gemini (Google AI) ────────────────────────────────────────────────────────
-GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL        = "gemini-2.5-flash"
-AGENT_MAX_ITERATIONS = 30
+# ── Anthropic (Claude) ────────────────────────────────────────────────────────
+ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL        = "claude-sonnet-4-6"
+AGENT_MAX_ITERATIONS   = 30
 
 # ── Canva OAuth credentials ───────────────────────────────────────────────────
 CANVA_CLIENT_ID:     str = os.environ.get("CANVA_CLIENT_ID", "")
 CANVA_CLIENT_SECRET: str = os.environ.get("CANVA_CLIENT_SECRET", "")
 CANVA_ACCESS_TOKEN:  str = os.environ.get("CANVA_ACCESS_TOKEN", "")
 CANVA_REFRESH_TOKEN: str = os.environ.get("CANVA_REFRESH_TOKEN", "")
-CANVA_REDIRECT_URI:  str = os.environ.get("CANVA_REDIRECT_URI", "http://localhost:8080/callback")
+CANVA_REDIRECT_URI:  str = os.environ.get("CANVA_REDIRECT_URI", "http://127.0.0.1:8080/callback")
 
 # ── Web search (optional) ─────────────────────────────────────────────────────
 SEARCH_API_KEY:  str = os.environ.get("SEARCH_API_KEY", "")
@@ -63,8 +63,8 @@ TOKEN_CACHE_PATH: str = os.path.expanduser("~/.canva_agent_tokens.json")
 def validate() -> list[str]:
     """Return a list of missing required config keys (empty list = all good)."""
     missing = []
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
     if not CANVA_CLIENT_ID:
         missing.append("CANVA_CLIENT_ID")
     if not CANVA_CLIENT_SECRET:
